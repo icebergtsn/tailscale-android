@@ -5,15 +5,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"image"
 	"image/color"
-	"math"
 	"net/netip"
 	"time"
 
+	_ "embed"
 	"gioui.org/f32"
 	"gioui.org/font/opentype"
 	"gioui.org/io/pointer"
@@ -31,9 +30,6 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
-	"tailscale.com/version"
-
-	_ "embed"
 
 	"eliasnaur.com/font/roboto/robotobold"
 	"eliasnaur.com/font/roboto/robotoregular"
@@ -56,31 +52,13 @@ type UI struct {
 	// webSigin is the button for the web-based sign-in flow.
 	webSignin widget.Clickable
 
-	// googleSignin is the button for native Google Sign-in.
-	googleSignin widget.Clickable
-
 	// openExitDialog opens the exit node picker.
 	openExitDialog widget.Clickable
 
 	signinType signinType
 
-	setLoginServer    bool
-	loginServer       widget.Editor
-	loginServerSave   widget.Clickable
-	loginServerCancel widget.Clickable
-
 	self  widget.Clickable
 	peers []widget.Clickable
-
-	// exitDialog is state for the exit node dialog.
-	exitDialog struct {
-		show    bool
-		dismiss Dismiss
-		exits   widget.Enum
-		list    layout.List
-	}
-
-	runningExit bool // are we an exit node now?
 
 	qr struct {
 		show bool
@@ -103,11 +81,7 @@ type UI struct {
 		useLoginServer widget.Clickable
 		copy           widget.Clickable
 		reauth         widget.Clickable
-		bug            widget.Clickable
-		beExit         widget.Clickable
-		exits          widget.Clickable
-		about          widget.Clickable
-		logout         widget.Clickable
+		//logout         widget.Clickable
 	}
 
 	// The current pop-up message, if any
@@ -127,23 +101,12 @@ type UI struct {
 		error   error
 	}
 
-	// aboutDialog is state for the about dialog.
-	aboutDialog struct {
-		show    bool
-		dismiss Dismiss
-	}
-
-	// ossLicenses is the button to show the OSS licenses.
-	ossLicenses widget.Clickable
-
 	icons struct {
 		search     *widget.Icon
 		more       *widget.Icon
 		exitStatus *widget.Icon
 		done       *widget.Icon
 		error      *widget.Icon
-		logo       paint.ImageOp
-		google     paint.ImageOp
 	}
 }
 
@@ -175,8 +138,8 @@ type menuItem struct {
 }
 
 const (
-	headerColor = 0x496495
-	infoColor   = 0x3a517b
+	headerColor = 0x0D0D0D08
+	infoColor   = 0x28282828
 	white       = 0xffffff
 )
 
@@ -187,19 +150,11 @@ const (
 const (
 	noSignin signinType = iota
 	webSignin
-	googleSignin
 )
 
 type (
 	C = layout.Context
 	D = layout.Dimensions
-)
-
-var (
-	//go:embed tailscale.png
-	tailscaleLogo []byte
-	//go:embed google.png
-	googleLogo []byte
 )
 
 func newUI(store *stateStore) (*UI, error) {
@@ -223,14 +178,6 @@ func newUI(store *stateStore) (*UI, error) {
 	if err != nil {
 		return nil, err
 	}
-	logo, _, err := image.Decode(bytes.NewReader(tailscaleLogo))
-	if err != nil {
-		return nil, err
-	}
-	google, _, err := image.Decode(bytes.NewReader(googleLogo))
-	if err != nil {
-		return nil, err
-	}
 	face, err := opentype.Parse(robotoregular.TTF)
 	if err != nil {
 		panic(fmt.Sprintf("failed to parse font: %v", err))
@@ -247,20 +194,18 @@ func newUI(store *stateStore) (*UI, error) {
 		theme: material.NewTheme(fonts),
 		store: store,
 	}
+
 	ui.intro.show, _ = store.ReadBool(keyShowIntro, true)
 	ui.icons.search = searchIcon
 	ui.icons.more = moreIcon
 	ui.icons.exitStatus = exitStatus
 	ui.icons.done = doneIcon
 	ui.icons.error = errorIcon
-	ui.icons.logo = paint.NewImageOp(logo)
-	ui.icons.google = paint.NewImageOp(google)
 	ui.root.Axis = layout.Vertical
 	ui.intro.list.Axis = layout.Vertical
 	ui.search.SingleLine = true
-	ui.loginServer.SingleLine = true
-	ui.exitDialog.list.Axis = layout.Vertical
 	ui.shareDialog.list.Axis = layout.Vertical
+	ui.signinType = webSignin
 
 	// If they've ever set the control plane, give them the debug menu right away.
 	if v, _ := ui.store.ReadString(customLoginServerPrefKey, ""); v != "" {
@@ -292,10 +237,6 @@ func (ui *UI) activeDialog() *bool {
 		return &ui.menu.show
 	case ui.shareDialog.show:
 		return &ui.shareDialog.show
-	case ui.exitDialog.show:
-		return &ui.exitDialog.show
-	case ui.aboutDialog.show:
-		return &ui.aboutDialog.show
 	}
 	return nil
 }
@@ -338,7 +279,6 @@ func (ui *UI) layout(gtx layout.Context, sysIns system.Insets, state *clientStat
 		ui.layoutIntro(gtx, sysIns)
 		return nil
 	}
-
 	var events []UIEvent
 
 	if ui.enabled.Changed() {
@@ -373,42 +313,8 @@ func (ui *UI) layout(gtx layout.Context, sysIns system.Insets, state *clientStat
 	if p := state.backend.Prefs; p != nil {
 		exitID = p.ExitNodeID
 	}
-	if d := &ui.exitDialog; d.show {
-		if newID := tailcfg.StableNodeID(d.exits.Value); newID != exitID {
-			d.show = false
-			events = append(events, RouteAllEvent{newID})
-		}
-	} else {
-		d.exits.Value = string(exitID)
-	}
 	if ui.exitLAN.Changed() {
 		events = append(events, ExitAllowLANEvent(ui.exitLAN.Value))
-	}
-
-	if ui.googleSignin.Clicked() {
-		ui.signinType = googleSignin
-		events = append(events, GoogleAuthEvent{})
-	}
-
-	if ui.webSignin.Clicked() {
-		ui.signinType = webSignin
-		events = append(events, WebAuthEvent{})
-	}
-
-	if ui.loginServerSave.Clicked() {
-		text := ui.loginServer.Text()
-		ui.showMessage(gtx, "Login server saved")
-		events = append(events, SetLoginServerEvent{URL: text})
-		ui.setLoginServer = false
-	}
-	if ui.loginServerCancel.Clicked() {
-		ui.setLoginServer = false
-	}
-
-	if ui.menuClicked(&ui.menu.useLoginServer) {
-		ui.setLoginServer = true
-		savedLoginServer, _ := ui.store.ReadString(customLoginServerPrefKey, "")
-		ui.loginServer.SetText(savedLoginServer)
 	}
 
 	if ui.menuClicked(&ui.menu.copy) && localAddr != "" {
@@ -420,36 +326,9 @@ func (ui *UI) layout(gtx layout.Context, sysIns system.Insets, state *clientStat
 		events = append(events, ReauthEvent{})
 	}
 
-	if ui.menuClicked(&ui.menu.bug) {
-		events = append(events, BugEvent{})
-		ui.showCopied(gtx, "bug report marker to clipboard")
-	}
-
-	if ui.menuClicked(&ui.menu.beExit) {
-		ui.runningExit = !ui.runningExit
-		events = append(events, BeExitNodeEvent(ui.runningExit))
-		if ui.runningExit {
-			ui.showMessage(gtx, "Running exit node")
-		} else {
-			ui.showMessage(gtx, "Stopped running exit node")
-		}
-	}
-
-	if ui.menuClicked(&ui.menu.exits) || ui.openExitDialog.Clicked() {
-		ui.exitDialog.show = true
-	}
-
-	if ui.menuClicked(&ui.menu.about) {
-		ui.aboutDialog.show = true
-	}
-
-	if ui.ossLicenses.Clicked() {
-		events = append(events, OSSLicensesEvent{})
-	}
-
-	if ui.menuClicked(&ui.menu.logout) {
-		events = append(events, LogoutEvent{})
-	}
+	//if ui.menuClicked(&ui.menu.logout) {
+	//	events = append(events, LogoutEvent{})
+	//}
 
 	for i := range ui.shareDialog.targets {
 		t := &ui.shareDialog.targets[i]
@@ -535,7 +414,7 @@ func (ui *UI) layout(gtx layout.Context, sysIns system.Insets, state *clientStat
 				if !needsLogin {
 					return D{}
 				}
-				return ui.layoutSignIn(gtx, &state.backend)
+				return ui.layoutLoading(gtx)
 			case 5:
 				// Formerly "No internet connection", which has been removed.
 				return D{}
@@ -566,11 +445,7 @@ func (ui *UI) layout(gtx layout.Context, sysIns system.Insets, state *clientStat
 		})
 	})
 
-	ui.layoutExitNodeDialog(gtx, sysIns, state.backend.Exits)
-
 	ui.layoutShareDialog(gtx, sysIns)
-
-	ui.layoutAboutDialog(gtx, sysIns)
 
 	// Popup messages.
 	ui.layoutMessage(gtx, sysIns)
@@ -586,6 +461,46 @@ func (ui *UI) layout(gtx layout.Context, sysIns system.Insets, state *clientStat
 
 	return events
 }
+
+func (ui *UI) layoutIntro(gtx layout.Context, sysIns system.Insets) {
+	fill{rgb(0x232323)}.Layout(gtx, gtx.Constraints.Max)
+	ui.intro.list.Layout(gtx, 1, func(gtx C, idx int) D {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx C) D {
+				return layout.Inset{
+					Top:   unit.Dp(248),
+					Left:  unit.Dp(32),
+					Right: unit.Dp(32),
+				}.Layout(gtx, func(gtx C) D {
+					terms := material.Body2(ui.theme, termsText)
+					terms.Color = rgb(0xbfbfbf)
+					terms.Alignment = text.Middle
+					return terms.Layout(gtx)
+				})
+			}),
+			// "Get started".
+			layout.Rigid(func(gtx C) D {
+				return layout.Inset{
+					Top:    unit.Dp(116),
+					Left:   unit.Dp(16),
+					Right:  unit.Dp(16),
+					Bottom: sysIns.Bottom,
+				}.Layout(gtx, func(gtx C) D {
+					start := material.Button(ui.theme, &ui.intro.start, "Get Started")
+					start.Inset = layout.UniformInset(unit.Dp(16))
+					start.CornerRadius = unit.Dp(16)
+					start.Background = rgb(0x496495)
+					start.TextSize = unit.Sp(20)
+					return start.Layout(gtx)
+				})
+			}),
+		)
+	})
+}
+
+const termsText = `This feature is a mesh VPN for securely connecting your devices.
+
+We collect and use your device name, OS version, and IP address in order to help you to connect your devices and manage your settings. We log when you are connected to your network.`
 
 func (ui *UI) layoutQR(gtx layout.Context, sysIns system.Insets) layout.Dimensions {
 	fill{rgb(0x232323)}.Layout(gtx, gtx.Constraints.Max)
@@ -713,107 +628,6 @@ func (ui *UI) layoutExitStatus(gtx layout.Context, state *BackendState) layout.D
 	})
 }
 
-// layoutSignIn lays out the sign in button(s).
-func (ui *UI) layoutSignIn(gtx layout.Context, state *BackendState) layout.Dimensions {
-	return layout.Inset{Top: unit.Dp(48), Left: unit.Dp(48), Right: unit.Dp(48)}.Layout(gtx, func(gtx C) D {
-		const (
-			textColor = 0x555555
-		)
-
-		border := widget.Border{Color: rgb(textColor), CornerRadius: unit.Dp(4), Width: unit.Dp(1)}
-
-		if ui.setLoginServer {
-			return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
-				layout.Rigid(func(gtx C) D {
-					return layout.Inset{Bottom: unit.Dp(16)}.Layout(gtx, func(gtx C) D {
-						return Background{Color: rgb(0xe3e2ea), CornerRadius: unit.Dp(8)}.Layout(gtx, func(gtx C) D {
-							return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx C) D {
-								return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-									layout.Flexed(1,
-										material.Editor(ui.theme, &ui.loginServer, "https://controlplane.tailscale.com").Layout,
-									),
-								)
-							})
-						})
-					})
-				}),
-				layout.Rigid(func(gtx C) D {
-					return layout.Inset{Bottom: unit.Dp(16)}.Layout(gtx, func(gtx C) D {
-						return border.Layout(gtx, func(gtx C) D {
-							button := material.Button(ui.theme, &ui.loginServerSave, "Save")
-							button.Background = color.NRGBA{} // transparent
-							button.Color = rgb(textColor)
-							return button.Layout(gtx)
-						})
-					})
-				}),
-				layout.Rigid(func(gtx C) D {
-					return border.Layout(gtx, func(gtx C) D {
-						button := material.Button(ui.theme, &ui.loginServerCancel, "Cancel")
-						button.Background = color.NRGBA{} // transparent
-						button.Color = rgb(textColor)
-						return button.Layout(gtx)
-					})
-				}),
-			)
-		}
-
-		return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
-			layout.Rigid(func(gtx C) D {
-				if !googleSignInEnabled() {
-					return D{}
-				}
-				return layout.Inset{Bottom: unit.Dp(16)}.Layout(gtx, func(gtx C) D {
-					signin := material.ButtonLayout(ui.theme, &ui.googleSignin)
-					signin.Background = color.NRGBA{} // transparent
-
-					return ui.withLoader(gtx, ui.signinType == googleSignin, func(gtx C) D {
-						return border.Layout(gtx, func(gtx C) D {
-							if ui.signinType != noSignin {
-								gtx.Queue = nil
-							}
-							return signin.Layout(gtx, func(gtx C) D {
-								gtx.Constraints.Max.Y = gtx.Dp(unit.Dp(48))
-								return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-									layout.Rigid(func(gtx C) D {
-										return layout.Inset{Right: unit.Dp(4)}.Layout(gtx, func(gtx C) D {
-											return drawImage(gtx, ui.icons.google, unit.Dp(16))
-										})
-									}),
-									layout.Rigid(func(gtx C) D {
-										return layout.Inset{Top: unit.Dp(10), Bottom: unit.Dp(10)}.Layout(gtx, func(gtx C) D {
-											l := material.Body2(ui.theme, "Sign in with Google")
-											l.Color = rgb(textColor)
-											return l.Layout(gtx)
-										})
-									}),
-								)
-							})
-						})
-					})
-				})
-			}),
-			layout.Rigid(func(gtx C) D {
-				label := "Sign in with other"
-				if !googleSignInEnabled() {
-					label = "Sign in"
-				}
-				return ui.withLoader(gtx, ui.signinType == webSignin, func(gtx C) D {
-					return border.Layout(gtx, func(gtx C) D {
-						if ui.signinType != noSignin {
-							gtx.Queue = nil
-						}
-						signin := material.Button(ui.theme, &ui.webSignin, label)
-						signin.Background = color.NRGBA{} // transparent
-						signin.Color = rgb(textColor)
-						return signin.Layout(gtx)
-					})
-				})
-			}),
-		)
-	})
-}
-
 func (ui *UI) withLoader(gtx layout.Context, loading bool, w layout.Widget) layout.Dimensions {
 	cons := gtx.Constraints
 	return layout.Stack{Alignment: layout.W}.Layout(gtx,
@@ -833,60 +647,6 @@ func (ui *UI) withLoader(gtx layout.Context, loading bool, w layout.Widget) layo
 			})
 		}),
 	)
-}
-
-// layoutIntro lays out the intro page with the logo and terms.
-func (ui *UI) layoutIntro(gtx layout.Context, sysIns system.Insets) {
-	fill{rgb(0x232323)}.Layout(gtx, gtx.Constraints.Max)
-	ui.intro.list.Layout(gtx, 1, func(gtx C, idx int) D {
-		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-			// 9 dot logo.
-			layout.Rigid(func(gtx C) D {
-				return layout.Inset{Top: unit.Dp(80), Bottom: unit.Dp(48)}.Layout(gtx, func(gtx C) D {
-					return layout.N.Layout(gtx, func(gtx C) D {
-						sz := gtx.Dp(unit.Dp(72))
-						drawLogo(gtx.Ops, sz)
-						return layout.Dimensions{Size: image.Pt(sz, sz)}
-					})
-				})
-			}),
-			// "tailscale".
-			layout.Rigid(func(gtx C) D {
-				return layout.N.Layout(gtx, func(gtx C) D {
-					return drawImage(gtx, ui.icons.logo, unit.Dp(200))
-				})
-			}),
-			// Terms.
-			layout.Rigid(func(gtx C) D {
-				return layout.Inset{
-					Top:   unit.Dp(48),
-					Left:  unit.Dp(32),
-					Right: unit.Dp(32),
-				}.Layout(gtx, func(gtx C) D {
-					terms := material.Body2(ui.theme, termsText)
-					terms.Color = rgb(0xbfbfbf)
-					terms.Alignment = text.Middle
-					return terms.Layout(gtx)
-				})
-			}),
-			// "Get started".
-			layout.Rigid(func(gtx C) D {
-				return layout.Inset{
-					Top:    unit.Dp(16),
-					Left:   unit.Dp(16),
-					Right:  unit.Dp(16),
-					Bottom: sysIns.Bottom,
-				}.Layout(gtx, func(gtx C) D {
-					start := material.Button(ui.theme, &ui.intro.start, "Get Started")
-					start.Inset = layout.UniformInset(unit.Dp(16))
-					start.CornerRadius = unit.Dp(16)
-					start.Background = rgb(0x496495)
-					start.TextSize = unit.Sp(20)
-					return start.Layout(gtx)
-				})
-			}),
-		)
-	})
 }
 
 // menuClicked is like btn.Clicked, but also closes the menu if true.
@@ -1007,131 +767,6 @@ func (ui *UI) layoutShareDialog(gtx layout.Context, sysIns system.Insets) {
 	})
 }
 
-// layoutExitNodeDialog lays out the exit node selection dialog.
-func (ui *UI) layoutExitNodeDialog(gtx layout.Context, sysIns system.Insets, exits []Peer) {
-	d := &ui.exitDialog
-	if d.dismiss.Dismissed(gtx) {
-		d.show = false
-	}
-	if !d.show {
-		return
-	}
-	d.dismiss.Add(gtx, argb(0x66000000))
-	layout.Inset{
-		Top:    sysIns.Top + unit.Dp(16),
-		Right:  sysIns.Right + unit.Dp(16),
-		Bottom: sysIns.Bottom + unit.Dp(16),
-		Left:   sysIns.Left + unit.Dp(16),
-	}.Layout(gtx, func(gtx C) D {
-		return layout.Center.Layout(gtx, func(gtx C) D {
-			gtx.Constraints.Min.X = gtx.Dp(unit.Dp(250))
-			gtx.Constraints.Max.X = gtx.Constraints.Min.X
-			return layoutDialog(gtx, func(gtx C) D {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx C) D {
-						// Header.
-						return layout.Inset{
-							Top:    unit.Dp(16),
-							Right:  unit.Dp(20),
-							Left:   unit.Dp(20),
-							Bottom: unit.Dp(16),
-						}.Layout(gtx, func(gtx C) D {
-							l := material.Body1(ui.theme, "Use exit node...")
-							l.Font.Weight = text.Bold
-							return l.Layout(gtx)
-						})
-					}),
-					layout.Flexed(1, func(gtx C) D {
-						gtx.Constraints.Min.Y = 0
-						// Add "none" exit node, then "Allow LAN" checkbox, then the exit nodes.
-						n := len(exits) + 2
-						return d.list.Layout(gtx, n, func(gtx C, idx int) D {
-							if idx == 0 {
-								btn := material.CheckBox(ui.theme, &ui.exitLAN, "Allow LAN access")
-								return layout.Inset{
-									Right:  unit.Dp(16),
-									Left:   unit.Dp(16),
-									Bottom: unit.Dp(16),
-								}.Layout(gtx, btn.Layout)
-							}
-							node := Peer{Label: "None", Online: true}
-							if idx >= 2 {
-								node = exits[idx-2]
-							}
-							lbl := node.Label
-							if !node.Online {
-								lbl = lbl + " (offline)"
-							}
-							btn := material.RadioButton(ui.theme, &d.exits, string(node.ID), lbl)
-							if !node.Online {
-								btn.Color = rgb(0xbbbbbb)
-								btn.IconColor = btn.Color
-							}
-							return layout.Inset{
-								Right:  unit.Dp(16),
-								Left:   unit.Dp(16),
-								Bottom: unit.Dp(16),
-							}.Layout(gtx, btn.Layout)
-						})
-					}),
-				)
-			})
-		})
-	})
-}
-
-// layoutAboutDialog lays out the about dialog.
-func (ui *UI) layoutAboutDialog(gtx layout.Context, sysIns system.Insets) {
-	d := &ui.aboutDialog
-	if d.dismiss.Dismissed(gtx) {
-		d.show = false
-	}
-	if !d.show {
-		return
-	}
-	d.dismiss.Add(gtx, argb(0x66000000))
-	layout.Inset{
-		Top:    sysIns.Top + unit.Dp(16),
-		Right:  sysIns.Right + unit.Dp(16),
-		Bottom: sysIns.Bottom + unit.Dp(16),
-		Left:   sysIns.Left + unit.Dp(16),
-	}.Layout(gtx, func(gtx C) D {
-		return layout.Center.Layout(gtx, func(gtx C) D {
-			gtx.Constraints.Min.X = gtx.Dp(unit.Dp(250))
-			gtx.Constraints.Max.X = gtx.Constraints.Min.X
-			return layoutDialog(gtx, func(gtx C) D {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx C) D {
-						// Header.
-						return layout.Inset{
-							Top:    unit.Dp(16),
-							Right:  unit.Dp(20),
-							Left:   unit.Dp(20),
-							Bottom: unit.Dp(16),
-						}.Layout(gtx, func(gtx C) D {
-							l := material.Body1(ui.theme, "About")
-							l.Font.Weight = text.Bold
-							return l.Layout(gtx)
-						})
-					}),
-					layout.Rigid(func(gtx C) D {
-						return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx C) D {
-							return material.Body1(ui.theme, "version "+version.Short()).Layout(gtx)
-						})
-					}),
-					layout.Rigid(func(gtx C) D {
-						return material.Clickable(gtx, &ui.ossLicenses, func(gtx C) D {
-							return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx C) D {
-								return material.Body1(ui.theme, "Open Source Licenses").Layout(gtx)
-							})
-						})
-					}),
-				)
-			})
-		})
-	})
-}
-
 func layoutMenu(th *material.Theme, gtx layout.Context, items []menuItem, header layout.Widget) layout.Dimensions {
 	return layoutDialog(gtx, func(gtx C) D {
 		// Lay out menu items twice; once for
@@ -1194,48 +829,22 @@ func (ui *UI) layoutMenu(gtx layout.Context, sysIns system.Insets, expiry time.T
 	if ui.menu.dismiss.Dismissed(gtx) {
 		ui.setMenuShown(false)
 	}
+	if needsLogin {
+		return
+	}
 	layout.Inset{
 		Top:   sysIns.Top + unit.Dp(2),
 		Right: sysIns.Right + unit.Dp(2),
 	}.Layout(gtx, func(gtx C) D {
 		return layout.NE.Layout(gtx, func(gtx C) D {
 			menu := &ui.menu
-			if ui.setLoginServer {
-				return D{}
-			}
-			if needsLogin {
-				var items []menuItem
-				title := "Tailscale " + version.Short()
-				if ui.menu.showDebugMenu {
-					items = append(items, menuItem{title: "Change server", btn: &menu.useLoginServer})
-				}
-				items = append(items, menuItem{title: "About", btn: &menu.about})
-				return layoutMenu(ui.theme, gtx, items, func(gtx C) D {
-					l := material.Caption(ui.theme, title)
-					return l.Layout(gtx)
-				})
-			}
 			items := []menuItem{
 				{title: "Copy my IP address", btn: &menu.copy},
 			}
-			if showExits {
-				items = append(items, menuItem{title: "Use exit node...", btn: &menu.exits})
-			}
 			items = append(items,
-				menuItem{title: "Bug report", btn: &menu.bug},
 				menuItem{title: "Reauthenticate", btn: &menu.reauth},
-				menuItem{title: "Log out", btn: &menu.logout},
+				//menuItem{title: "Log out", btn: &menu.logout},
 			)
-
-			var title string
-			if ui.runningExit {
-				title = "Stop running exit node"
-			} else {
-				title = "Run exit node"
-			}
-			items = append(items, menuItem{title: title, btn: &menu.beExit})
-
-			items = append(items, menuItem{title: "About", btn: &menu.about})
 
 			return layoutMenu(ui.theme, gtx, items, func(gtx C) D {
 				var expiryStr string
@@ -1406,7 +1015,7 @@ func statusString(state ipn.State) string {
 	case ipn.NeedsMachineAuth:
 		return "Awaiting Approval"
 	case ipn.NeedsLogin:
-		return "Tailscale"
+		return "Login"
 	default:
 		return "Loading..."
 	}
@@ -1475,45 +1084,12 @@ func (ui *UI) layoutSearchbar(gtx layout.Context, sysIns system.Insets) layout.D
 	})
 }
 
-// drawLogo draws the Tailscale logo using vector operations.
-func drawLogo(ops *op.Ops, size int) {
-	scale := float64(size) / 680
-	discDia := float32(170 * scale)
-	off := int(math.Round(172 * 1.5 * scale))
-	tx := op.Offset(image.Pt(off, 0))
-	ty := op.Offset(image.Pt(0, off))
-
-	defer op.Offset(image.Point{}).Push(ops).Pop()
-
-	// First row of discs.
-	row := op.Offset(image.Point{}).Push(ops)
-	drawDisc(ops, discDia, rgb(0x54514d))
-	tx.Add(ops)
-	drawDisc(ops, discDia, rgb(0x54514d))
-	tx.Add(ops)
-	drawDisc(ops, discDia, rgb(0x54514d))
-	row.Pop()
-
-	ty.Add(ops)
-	// Second row.
-	row = op.Offset(image.Point{}).Push(ops)
-	drawDisc(ops, discDia, rgb(0xfffdfa))
-	tx.Add(ops)
-	drawDisc(ops, discDia, rgb(0xfffdfa))
-	tx.Add(ops)
-	drawDisc(ops, discDia, rgb(0xfffdfa))
-	row.Pop()
-
-	ty.Add(ops)
-	// Third row.
-	row = op.Offset(image.Point{}).Push(ops)
-	drawDisc(ops, discDia, rgb(0xfffdfa))
-	drawDisc(ops, discDia, rgb(0x54514d))
-	tx.Add(ops)
-	drawDisc(ops, discDia, rgb(0xfffdfa))
-	tx.Add(ops)
-	drawDisc(ops, discDia, rgb(0x54514d))
-	row.Pop()
+func (ui *UI) layoutLoading(gtx C) D {
+	return layout.Inset{Top: unit.Dp(200)}.Layout(gtx, func(gtx C) D {
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return material.Loader(ui.theme).Layout(gtx)
+		})
+	})
 }
 
 func drawImage(gtx layout.Context, img paint.ImageOp, size unit.Dp) layout.Dimensions {
@@ -1526,17 +1102,6 @@ func drawImage(gtx layout.Context, img paint.ImageOp, size unit.Dp) layout.Dimen
 	defer op.Affine(f32.Affine2D{}.Scale(f32.Point{}, f32.Point{X: scale, Y: scale})).Push(gtx.Ops).Pop()
 	paint.PaintOp{}.Add(gtx.Ops)
 	return layout.Dimensions{Size: image.Pt(w, h)}
-}
-
-func drawDisc(ops *op.Ops, radius float32, col color.NRGBA) {
-	r := int(math.Round(float64(radius)))
-	r2 := int(math.Round(float64(radius * .5)))
-	defer clip.RRect{
-		Rect: image.Rect(0, 0, r, r),
-		NE:   r2, NW: r2, SE: r2, SW: r2,
-	}.Push(ops).Pop()
-	paint.ColorOp{Color: col}.Add(ops)
-	paint.PaintOp{}.Add(ops)
 }
 
 // Background lays out a widget and draws a color background behind it.
@@ -1580,7 +1145,3 @@ func rgb(c uint32) color.NRGBA {
 func argb(c uint32) color.NRGBA {
 	return color.NRGBA{A: uint8(c >> 24), R: uint8(c >> 16), G: uint8(c >> 8), B: uint8(c)}
 }
-
-const termsText = `Tailscale is a mesh VPN for securely connecting your devices. All connections are device-to-device, so we never see your data.
-
-We collect and use your email address and name, as well as your device name, OS version, and IP address in order to help you to connect your devices and manage your settings. We log when you are connected to your network.`

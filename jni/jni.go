@@ -266,6 +266,12 @@ func CallBooleanMethod(e *Env, obj Object, method MethodID, args ...Value) (bool
 	return res == C.JNI_TRUE, exception(e)
 }
 
+// CallStringMethod is a Go wrapper function to call a Java method that returns a string.
+func CallStringMethod(e *Env, obj Object, method MethodID, args ...Value) (string, error) {
+	cStr := C.jni_CallObjectMethodA(env(e), C.jobject(obj), C.jmethodID(method), varArgs(args))
+	return GoString(e, String(cStr)), exception(e)
+}
+
 func CallIntMethod(e *Env, obj Object, method MethodID, args ...Value) (int32, error) {
 	res := C.jni_CallIntMethodA(env(e), C.jobject(obj), C.jmethodID(method), varArgs(args))
 	return int32(res), exception(e)

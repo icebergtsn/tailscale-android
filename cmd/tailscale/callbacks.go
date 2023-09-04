@@ -34,9 +34,6 @@ var (
 	// conditions change.
 	onConnectivityChange = make(chan bool, 1)
 
-	// onGoogleToken receives google ID tokens.
-	onGoogleToken = make(chan string)
-
 	// onFileShare receives file sharing intents.
 	onFileShare = make(chan []File, 1)
 
@@ -109,12 +106,12 @@ func Java_com_tailscale_ipn_IPNService_disconnect(env *C.JNIEnv, this C.jobject)
 
 //export Java_com_tailscale_ipn_StartVPNWorker_connect
 func Java_com_tailscale_ipn_StartVPNWorker_connect(env *C.JNIEnv, this C.jobject) {
-    requestBackend(ConnectEvent{Enable: true})
+	requestBackend(ConnectEvent{Enable: true})
 }
 
 //export Java_com_tailscale_ipn_StopVPNWorker_disconnect
 func Java_com_tailscale_ipn_StopVPNWorker_disconnect(env *C.JNIEnv, this C.jobject) {
-    requestBackend(ConnectEvent{Enable: false})
+	requestBackend(ConnectEvent{Enable: false})
 }
 
 //export Java_com_tailscale_ipn_App_onConnectivityChanged
@@ -134,21 +131,6 @@ func Java_com_tailscale_ipn_QuickToggleService_onTileClick(env *C.JNIEnv, cls C.
 //export Java_com_tailscale_ipn_Peer_onActivityResult0
 func Java_com_tailscale_ipn_Peer_onActivityResult0(env *C.JNIEnv, cls C.jclass, act C.jobject, reqCode, resCode C.jint) {
 	switch reqCode {
-	case requestSignin:
-		if resCode != resultOK {
-			onGoogleToken <- ""
-			break
-		}
-		jenv := (*jni.Env)(unsafe.Pointer(env))
-		m := jni.GetStaticMethodID(jenv, googleClass,
-			"getIdTokenForActivity", "(Landroid/app/Activity;)Ljava/lang/String;")
-		idToken, err := jni.CallStaticObjectMethod(jenv, googleClass, m, jni.Value(act))
-		if err != nil {
-			fatalErr(err)
-			break
-		}
-		tok := jni.GoString(jenv, jni.String(idToken))
-		onGoogleToken <- tok
 	case requestPrepareVPN:
 		if resCode == resultOK {
 			notifyVPNPrepared()

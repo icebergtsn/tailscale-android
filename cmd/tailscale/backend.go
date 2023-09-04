@@ -68,8 +68,7 @@ const (
 )
 
 const (
-	loginMethodGoogle = "google"
-	loginMethodWeb    = "web"
+	loginMethodWeb = "web"
 )
 
 // googleDNSServers are used on ChromeOS, where an empty VpnBuilder DNS setting results
@@ -165,9 +164,58 @@ func newBackend(dataDir string, jvm *jni.JVM, appCtx jni.Object, store *stateSto
 	return b, nil
 }
 
-func (b *backend) Start(notify func(n ipn.Notify)) error {
+// ====================
+func (b *backend) Start(notify func(n ipn.Notify)) (error, bool) {
 	b.backend.SetNotifyCallback(notify)
-	return b.backend.Start(ipn.Options{})
+	options := ipn.Options{}
+	accessKey, err := b.getAccessKey()
+	if err == nil {
+		log.Println("accessKey: " + accessKey)
+		options.AuthKey = accessKey
+		log.Println("options AuthKey set success")
+	} else {
+		log.Println("getAccessKey error" + err.Error())
+	}
+	server, err2 := b.getHeadScaleServer()
+	if err2 == nil {
+		log.Println("server: " + server)
+		options.UpdatePrefs = ipn.NewPrefs()
+		options.UpdatePrefs.ControlURL = server
+		options.UpdatePrefs.WantRunning = true
+		log.Println("options UpdatePrefs ControlURL set success")
+	} else {
+		log.Println("getHeadScaleServer error" + err2.Error())
+	}
+	return b.backend.Start(options), accessKey != "" && server != ""
+}
+
+//====================
+
+func (b *backend) getAccessKey() (string, error) {
+	return b.callStringMethod(b.appCtx, "getAccessKey", "()Ljava/lang/String;")
+}
+
+func (b *backend) getHeadScaleServer() (string, error) {
+	return b.callStringMethod(b.appCtx, "getHeadScaleServer", "()Ljava/lang/String;")
+}
+
+func (b *backend) callStringMethod(obj jni.Object, name, sig string, args ...jni.Value) (string, error) {
+	if obj == 0 {
+		panic("invalid object")
+	}
+	var result string
+	err := jni.Do(b.jvm, func(env *jni.Env) error {
+		cls := jni.GetObjectClass(env, obj)
+		m := jni.GetMethodID(env, cls, name, sig)
+		var callArgs []jni.Value
+		callArgs = append(callArgs, args...)
+		res, err := jni.CallStringMethod(env, obj, m, callArgs...)
+		if err == nil {
+			result = res
+		}
+		return err
+	})
+	return result, err
 }
 
 func (b *backend) LinkChange() {
@@ -437,7 +485,7 @@ func (b *backend) getDNSBaseConfig() (ret dns.OSConfig, _ error) {
 		// DNS config are lacking, and almost all Android phones use Google
 		// services anyway, so it's a reasonable default: it's an ecosystem the
 		// user has selected by having an Android device.
-		if len(ret.Nameservers) == 0 && googleSignInEnabled() {
+		if len(ret.Nameservers) == 0 {
 			log.Printf("getDNSBaseConfig: none found; falling back to Google public DNS")
 			ret.Nameservers = append(ret.Nameservers, googleDNSServers...)
 		}

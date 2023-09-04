@@ -7,7 +7,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -66,11 +65,6 @@ type App struct {
 	// invalidates receives whenever the window should be refreshed.
 	invalidates chan struct{}
 }
-
-var (
-	// googleClass is a global reference to the com.tailscale.ipn.Google class.
-	googleClass jni.Class
-)
 
 type FileTargets struct {
 	Targets []*apitype.FileTarget
@@ -190,11 +184,8 @@ type SetLoginServerEvent struct {
 type (
 	ToggleEvent       struct{}
 	ReauthEvent       struct{}
-	BugEvent          struct{}
 	WebAuthEvent      struct{}
-	GoogleAuthEvent   struct{}
 	LogoutEvent       struct{}
-	OSSLicensesEvent  struct{}
 	BeExitNodeEvent   bool
 	ExitAllowLANEvent bool
 )
@@ -202,10 +193,6 @@ type (
 // serverOAuthID is the OAuth ID of the tailscale-android server, used
 // by GoogleSignInOptions.Builder.requestIdToken.
 const serverOAuthID = "744055068597-hv4opg0h7vskq1hv37nq3u26t8c15qk0.apps.googleusercontent.com"
-
-// releaseCertFingerprint is the SHA-1 fingerprint of the Google Play Store signing key.
-// It is used to check whether the app is signed for release.
-const releaseCertFingerprint = "86:9D:11:8B:63:1E:F8:35:C6:D9:C2:66:53:BC:28:22:2F:B8:C1:AE"
 
 // backendEvents receives events from the UI (Activity, Tile etc.) to the backend.
 var backendEvents = make(chan UIEvent)
@@ -219,19 +206,6 @@ func main() {
 		prefs:         make(chan *ipn.Prefs, 1),
 		targetsLoaded: make(chan FileTargets, 1),
 		invalidates:   make(chan struct{}, 1),
-	}
-	err := jni.Do(a.jvm, func(env *jni.Env) error {
-		loader := jni.ClassLoaderFor(env, a.appCtx)
-		cl, err := jni.LoadClass(env, loader, "com.tailscale.ipn.Google")
-		if err != nil {
-			// Ignore load errors; the Google class is not included in F-Droid builds.
-			return nil
-		}
-		googleClass = jni.Class(jni.NewGlobalRef(env, jni.Object(cl)))
-		return nil
-	})
-	if err != nil {
-		fatalErr(err)
 	}
 	a.store = newStateStore(a.jvm, a.appCtx)
 	interfaces.RegisterInterfaceGetter(a.getInterfaces)
@@ -255,9 +229,7 @@ func (a *App) runBackend() error {
 	}
 	paths.AppSharedDir.Store(appDir)
 	hostinfo.SetOSVersion(a.osVersion())
-	if !googleSignInEnabled() {
-		hostinfo.SetPackage("nogoogle")
-	}
+	hostinfo.SetPackage("nogoogle")
 	deviceModel := a.modelName()
 	if a.isChromeOS() {
 		deviceModel = "ChromeOS: " + deviceModel
@@ -304,10 +276,20 @@ func (a *App) runBackend() error {
 	// Start from a goroutine to avoid deadlock when Start
 	// calls the callback.
 	go func() {
-		startErr <- b.Start(func(n ipn.Notify) {
+		//====================
+		err, do := b.Start(func(n ipn.Notify) {
 			notifications <- n
 		})
+		if do {
+			log.Println("StartLoginInteractive success")
+			go b.backend.StartLoginInteractive()
+		} else {
+			log.Println("StartLoginInteractive failure")
+		}
+		startErr <- err
+		//====================
 	}()
+
 	var (
 		cfg       configPair
 		state     BackendState
@@ -358,6 +340,16 @@ func (a *App) runBackend() error {
 			first := state.Prefs == nil
 			if first {
 				state.Prefs = ipn.NewPrefs()
+				//====================
+				//server, err := a.getHeadScaleServer()
+				//log.Println("server: " + server)
+				//if err == nil {
+				//	state.Prefs.ControlURL = server
+				//	log.Printf("server set success")
+				//} else {
+				//	log.Println("getHeadScaleServer error" + err.Error())
+				//}
+				//====================
 				state.Prefs.Hostname = a.hostname()
 				go b.backend.SetPrefs(state.Prefs)
 				a.setPrefs(state.Prefs)
@@ -745,10 +737,6 @@ func (a *App) modelName() string {
 	return model
 }
 
-func googleSignInEnabled() bool {
-	return googleClass != 0
-}
-
 // updateNotification updates the foreground persistent status notification.
 func (a *App) updateNotification(service jni.Object, state ipn.State, exitStatus ExitStatus, exit Peer) error {
 	var msg, title string
@@ -890,25 +878,8 @@ func (a *App) runUI() error {
 		select {
 		case <-onVPNClosed:
 			requestBackend(ConnectEvent{Enable: false})
-		case tok := <-onGoogleToken:
-			ui.signinType = noSignin
-			if tok != "" {
-				requestBackend(OAuth2Event{
-					Token: &tailcfg.Oauth2Token{
-						AccessToken: tok,
-						TokenType:   ipn.GoogleIDTokenType,
-					},
-				})
-			} else {
-				// Warn about possible debug certificate.
-				if !a.isReleaseSigned() {
-					ui.ShowMessage("Google Sign-In failed because the app is not signed for Play Store")
-					w.Invalidate()
-				}
-			}
 		case p := <-a.prefs:
 			ui.enabled.Value = p.WantRunning
-			ui.runningExit = p.AdvertisesExitNode()
 			ui.exitLAN.Value = p.ExitNodeAllowLANAccess
 			w.Invalidate()
 		case url := <-a.browseURLs:
@@ -1007,32 +978,6 @@ func (a *App) isTV() bool {
 	return istv
 }
 
-// isReleaseSigned reports whether the app is signed with a release
-// signature.
-func (a *App) isReleaseSigned() bool {
-	var cert []byte
-	err := jni.Do(a.jvm, func(env *jni.Env) error {
-		cls := jni.GetObjectClass(env, a.appCtx)
-		m := jni.GetMethodID(env, cls, "getPackageCertificate", "()[B")
-		str, err := jni.CallObjectMethod(env, a.appCtx, m)
-		if err != nil {
-			return err
-		}
-		cert = jni.GetByteArrayElements(env, jni.ByteArray(str))
-		return nil
-	})
-	if err != nil {
-		fatalErr(err)
-	}
-	h := sha1.New()
-	h.Write(cert)
-	fingerprint := h.Sum(nil)
-	hex := fmt.Sprintf("%x", fingerprint)
-	// Strip colons and convert to lower case to ease comparing.
-	wantFingerprint := strings.ReplaceAll(strings.ToLower(releaseCertFingerprint), ":", "")
-	return hex == wantFingerprint
-}
-
 // attachPeer registers an Android Fragment instance for
 // handling onActivityResult callbacks.
 func (a *App) attachPeer(act jni.Object) {
@@ -1124,6 +1069,10 @@ func (a *App) prepareVPN(act jni.Object) error {
 		jni.Value(act), jni.Value(requestPrepareVPN))
 }
 
+func (a *App) getHeadScaleServer() (string, error) {
+	return a.callStringMethod(a.appCtx, "getHeadScaleServer", "()Ljava/lang/String;")
+}
+
 func requestBackend(e UIEvent) {
 	go func() {
 		backendEvents <- e
@@ -1136,16 +1085,9 @@ func (a *App) processUIEvents(w *app.Window, events []UIEvent, act jni.Object, s
 		case ReauthEvent:
 			method, _ := a.store.ReadString(loginMethodPrefKey, loginMethodWeb)
 			switch method {
-			case loginMethodGoogle:
-				a.googleSignIn(act)
 			default:
 				requestBackend(WebAuthEvent{})
 			}
-		case BugEvent:
-			backendLogID, _ := a.logIDPublicAtomic.Load().(string)
-			logMarker := fmt.Sprintf("BUG-%v-%v-%v", backendLogID, time.Now().UTC().Format("20060102150405Z"), randHex(8))
-			log.Printf("user bugreport: %s", logMarker)
-			w.WriteClipboard(logMarker)
 		case BeExitNodeEvent:
 			requestBackend(e)
 		case ExitAllowLANEvent:
@@ -1154,10 +1096,10 @@ func (a *App) processUIEvents(w *app.Window, events []UIEvent, act jni.Object, s
 			a.store.WriteString(loginMethodPrefKey, loginMethodWeb)
 			requestBackend(e)
 		case SetLoginServerEvent:
+			log.Println("url: " + e.URL)
 			a.store.WriteString(customLoginServerPrefKey, e.URL)
 			requestBackend(e)
 		case LogoutEvent:
-			a.signOut()
 			requestBackend(e)
 		case ConnectEvent:
 			requestBackend(e)
@@ -1165,16 +1107,11 @@ func (a *App) processUIEvents(w *app.Window, events []UIEvent, act jni.Object, s
 			requestBackend(e)
 		case CopyEvent:
 			w.WriteClipboard(e.Text)
-		case GoogleAuthEvent:
-			a.store.WriteString(loginMethodPrefKey, loginMethodGoogle)
-			a.googleSignIn(act)
 		case SearchEvent:
 			state.query = strings.ToLower(e.Query)
 			a.updateState(act, state)
 		case FileSendEvent:
 			a.sendFiles(e, files)
-		case OSSLicensesEvent:
-			a.setURL("https://tailscale.com/licenses/android")
 		}
 	}
 }
@@ -1278,36 +1215,6 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (a *App) signOut() {
-	if googleClass == 0 {
-		return
-	}
-	err := jni.Do(a.jvm, func(env *jni.Env) error {
-		m := jni.GetStaticMethodID(env, googleClass,
-			"googleSignOut", "(Landroid/content/Context;)V")
-		return jni.CallStaticVoidMethod(env, googleClass, m, jni.Value(a.appCtx))
-	})
-	if err != nil {
-		fatalErr(err)
-	}
-}
-
-func (a *App) googleSignIn(act jni.Object) {
-	if act == 0 || googleClass == 0 {
-		return
-	}
-	err := jni.Do(a.jvm, func(env *jni.Env) error {
-		sid := jni.JavaString(env, serverOAuthID)
-		m := jni.GetStaticMethodID(env, googleClass,
-			"googleSignIn", "(Landroid/app/Activity;Ljava/lang/String;I)V")
-		return jni.CallStaticVoidMethod(env, googleClass, m,
-			jni.Value(act), jni.Value(sid), jni.Value(requestSignin))
-	})
-	if err != nil {
-		fatalErr(err)
-	}
-}
-
 func (a *App) browseToURL(act jni.Object, url string) {
 	if act == 0 {
 		return
@@ -1330,6 +1237,25 @@ func (a *App) callVoidMethod(obj jni.Object, name, sig string, args ...jni.Value
 		m := jni.GetMethodID(env, cls, name, sig)
 		return jni.CallVoidMethod(env, obj, m, args...)
 	})
+}
+
+func (a *App) callStringMethod(obj jni.Object, name, sig string, args ...jni.Value) (string, error) {
+	if obj == 0 {
+		panic("invalid object")
+	}
+	var result string
+	err := jni.Do(a.jvm, func(env *jni.Env) error {
+		cls := jni.GetObjectClass(env, obj)
+		m := jni.GetMethodID(env, cls, name, sig)
+		var callArgs []jni.Value
+		callArgs = append(callArgs, args...)
+		res, err := jni.CallStringMethod(env, obj, m, callArgs...)
+		if err == nil {
+			result = res
+		}
+		return err
+	})
+	return result, err
 }
 
 // activityForView calls View.getContext and returns a global

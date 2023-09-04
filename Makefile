@@ -21,6 +21,7 @@ TAILSCALE_COMMIT=$(shell echo $(TAILSCALE_VERSION) | cut -d - -f 2 | cut -d t -f
 # Extract the version code from build.gradle.
 VERSIONCODE=$(lastword $(shell grep versionCode android/build.gradle))
 VERSIONCODE_PLUSONE=$(shell expr $(VERSIONCODE) + 1)
+LOCAL_AAR=/Users/bytetrade/webstorm/DIDVault/packages/app/src-capacitor/android/app/libs/ipn.aar
 ifeq ($(shell uname),Linux)
 	ANDROID_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip"
 	ANDROID_TOOLS_SUM="bd1aa17c7ef10066949c88dc6c9c8d536be27f992a1f3b5a584f9bd2ba5646a0  commandlinetools-linux-9477386_latest.zip"
@@ -167,5 +168,10 @@ dockershell:
 clean:
 	-rm -rf android/build $(DEBUG_APK) $(RELEASE_AAB) $(AAR) tailscale-fdroid.apk
 	-pkill -f gradle
+
+MakeAAR: toolchain checkandroidsdk android/libs
+	go run gioui.org/cmd/gogio \
+		-ldflags "-X tailscale.com/version.longStamp=$(VERSIONNAME) -X tailscale.com/version.shortStamp=$(VERSIONNAME_SHORT) -X tailscale.com/version.gitCommitStamp=$(TAILSCALE_COMMIT) -X tailscale.com/version.extraGitCommitStamp=$(OUR_VERSION)" \
+		-buildmode archive -target android -appid $(APPID) -tags novulkan,tailscale_go -o ${LOCAL_AAR} github.com/tailscale/tailscale-android/cmd/tailscale
 
 .PHONY: all clean install android/lib $(DEBUG_APK) $(RELEASE_AAB) $(AAR) release bump_version dockershell
